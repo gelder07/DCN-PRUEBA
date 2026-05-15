@@ -1,7 +1,7 @@
 
 # Análisis — Prueba Técnica DNC-ERP
 
-## Parte 1: Análisis de Código Legacy - Kardex
+## PARTE 1: Análisis de Código Legacy - Kardex
 
 ### 1 Identificación de problemas (performance)
 
@@ -56,7 +56,7 @@ en salidas el costo unitario se mantiene y solo disminuye la existencia.
 Se mantiene compatibilidad con la vista porque el repositorio devuelve las mismas columna que el controlador legacy (producto_id, producto, codigo, existencia, costo, valor_total). El cambio está en cómo se calculan los datos internamente, no en la estructura que recibe la vista.
 
 
-## 2. Bug de Producción Crítico
+## PARTE 2. Bug de Producción Crítico
 
 ### ¿Cuál es el bug exacto?
 No es solo que en la segunda línea del insert pongan cantidad_entrada otra vez.
@@ -128,3 +128,64 @@ merma = 100 - 85 = 15 qq
 La transformación se guarda en una tabla `transformaciones`, y los movimientos de inventario en `kardex` quedan vinculados con `transformacion_id`.
 
 La merma debe quedar registrada como parte del proceso para que el inventario sea auditable y no parezca que se perdieron cantidades sin explicación.
+
+## PARTE 3: Optimización de Query Crítica
+
+### Análisis 
+
+Segunla funcion EXPLAIN:
+
+Todas las subqueries dependen de las query principal, por cada combinacion de producto y bodega vuelve a consultar kardex 
+
+El cuello de botella principal son las subqueries correlacionadas contra kardex.
+
+Segun el analisis usando EXPLAIN:
+
+MySQL está leyendo:
+
+12 bodegas
+856 productos
+
+Eso genera: 12 × 856 = 10,272 combinaciones
+
+Subqueries:
+
+10,272 filas × 3 subqueries = 30,816 subqueries
+
+Cada subquery revisa aprox. 171 filas según EXPLAIN:
+
+30,816 × 171 ≈ 5,269,536 filas revisadas
+
+El query genera 10,272 combinaciones de producto-bodega y por cada una vuelve a consultar kardex tres veces. Aunque use idx_producto, no tiene índices compuestos que cubran producto_id, bodega_id, tipo y fecha, así que hace demasiado trabajo repetido.
+
+### 3.2 Solución con índices
+
+La query filtra por producto, bodega y tipo para calcular existencias. También filtra por producto, tipo y ordena por fecha descendiente para obtener el último costo.
+
+Por eso propongo estos índices compuestos:
+```sql
+CREATE INDEX idx_kardex_producto_bodega_tipo
+ON kardex (producto_id, bodega_id, tipo);
+
+```
+
+Este índice sirve para calcular existencias por producto y bodega. Permite que MySQL encuentre rápido los movimientos de un producto específico, en una bodega específica y por tipo de movimiento (entrada o salida), sin revisar todos los movimientos del producto.
+
+```sql
+
+CREATE INDEX idx_kardex_producto_tipo_fecha
+ON kardex (producto_id, tipo, fecha DESC);
+
+```
+Este índice sirve para obtener el último costo de entrada de un producto. Como la consulta busca por producto_id, filtra tipo = 'entrada' y ordena por fecha DESC, el índice permite encontrar el último movimiento de entrada sin hacer filesort.
+
+No agregaría muchos más índices porque cada índice adicional hace más lentas las escrituras en kardex (INSERT, UPDATE) y consume más espacio. Estos dos índices atacan directamente los filtros y ordenamientos del query crítico.
+
+Con estos índices, el query debería pasar de revisar muchas filas repetidas en subqueries a búsquedas mucho más directas. La mejora esperada para el resultado el tiempo sera rapido y optimo
+
+### 3.3 Refactorización del query
+
+La refactorización consiste que en lugar de calcular entradas, salidas y último costo por cada combinación producto-bodega, primero se agregan los datos de kardex y luego se unen al resultado principal.
+
+Sin indices por 11,569 resultados tiempo de 6.279 s
+Con indices por 11568 lineas tiempo de 0,782 s
