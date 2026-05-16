@@ -183,9 +183,90 @@ No agregaría muchos más índices porque cada índice adicional hace más lenta
 
 Con estos índices, el query debería pasar de revisar muchas filas repetidas en subqueries a búsquedas mucho más directas. La mejora esperada para el resultado el tiempo sera rapido y optimo
 
-### 3.3 Refactorización del query
+### Refactorización del query
 
 La refactorización consiste que en lugar de calcular entradas, salidas y último costo por cada combinación producto-bodega, primero se agregan los datos de kardex y luego se unen al resultado principal.
 
 Sin indices por 11,569 resultados tiempo de 6.279 s
 Con indices por 11568 lineas tiempo de 0,782 s
+
+## Parte 4: Arquitectura — Decisión Técnica Real
+
+###  Análisis de Opciones 
+
+
+Opción A — Sistema de colas con Redis/RabbitMQ
+La idea es simple: en lugar de procesar las facturas en el momento, las metes en una lista de espera (la cola) y un proceso separado las va consumiendo una por una o en lotes.
+
+Ventajas: el servidor web responde inmediatamente al usuario sin bloquearse, los workers pueden correr en paralelo, si una factura falla se reintenta automáticamente, y es fácil monitorear el progreso.
+
+Desventajas: requiere instalar y mantener Redis o RabbitMQ como servicio adicional, necesitas un proceso worker corriendo permanentemente (via Supervisor o systemd), y agrega complejidad de infraestructura que puede no estar disponible en un hosting legacy.
+
+Problemas potenciales: si el worker se cae sin Supervisor que lo levante, el proceso se detiene silenciosamente sin que nadie se entere.
+Complejidad: media-alta. El concepto es simple pero la configuración de infraestructura toma tiempo.
+
+Opción B — Cron job que procesa por lotes
+
+Un script PHP que el servidor ejecuta automáticamente cada cierto tiempo (cada minuto, cada 5 minutos) y procesa las facturas que encuentre pendientes en base de datos.
+Ventajas: extremadamente simple de implementar, no requiere instalar nada nuevo, funciona en cualquier hosting que tenga crontab, y es fácil de entender para cualquier desarrollador.
+
+Desventajas: el procesamiento no es inmediato, depende del intervalo del cron. Si el cron tarda más que su propio intervalo, los procesos se acumulan o se pisan entre sí.
+Problemas potenciales: si el script falla, nadie se entera hasta que el gerente pregunta por qué no llegaron las facturas. Tampoco puedes mostrarle al usuario un progreso en tiempo real porque el procesamiento ocurre fuera del ciclo de la aplicación.
+
+Complejidad: baja. Es la opción más accesible.
+
+Opción C — JavaScript enviando una por una con AJAX
+
+El navegador del usuario hace una petición HTTP al servidor por cada factura, espera la respuesta, y pasa a la siguiente.
+Ventajas: ninguna relevante para este volumen. Puede funcionar para 2 o 3 documentos.
+
+Desventajas: 500 facturas a 2-3 minutos cada una significa entre 16 y 25 horas de procesamiento secuencial. El usuario tiene que mantener el navegador abierto todo ese tiempo. Si cierra la pestaña o pierde conexión, se pierde todo el progreso.
+
+Problemas potenciales: el SAT probablemente rate-limitará las peticiones al detectar 500 requests seguidos desde la misma IP. El servidor mantiene 500 conexiones HTTP abiertas. Es inviable.
+
+Complejidad: baja de implementar, pero el resultado es inaceptable en producción.
+
+Opción D — Procesos paralelos con pcntl_fork
+
+PHP puede crear procesos hijo que corren en paralelo usando esta función. La idea sería lanzar N procesos simultáneos, uno por grupo de facturas.
+Ventajas: paralelismo real sin infraestructura externa.
+
+Desventajas: pcntl_fork no está disponible en la mayoría de hostings compartidos ni en muchos entornos Docker sin configuración especial. Gestionar 500 procesos hijo en el mismo servidor puede agotar la memoria y CPU fácilmente. La comunicación entre procesos padre e hijo es compleja y propensa a errores.
+
+Problemas potenciales: un memory leak en un proceso hijo puede derribar al padre. Si el servidor no tiene pcntl habilitado, el código simplemente no corre. Es una solución frágil que no pertenece en producción para este caso.
+
+Complejidad: alta, con riesgo elevado y poca recompensa frente a las otras opciones.
+
+###   Recomendación
+
+Siendo honesto, no había trabajado directamente con Redis o RabbitMQ antes de esta prueba, así que me di a la tarea de investigar cada opción antes de responder.
+
+La opción C la descarté rápido: hacer 500 requests desde el navegador uno por uno significa que el usuario espera horas, y si cierra la pestaña se pierde todo. No escala.
+
+La opción D con pcntl_fork la descarté porque en la mayoría de entornos de producción no está habilitada, y gestionar 500 procesos hijo en el mismo servidor puede tirar el hosting completo. Es una solución frágil para este volumen.
+
+Entre A y B la decisión fue más interesante. El cron job es simple y funciona, pero tiene un problema serio: si falla, nadie se entera hasta que el gerente pregunta por qué no llegaron las facturas. Tampoco puedes decirle al usuario cuánto falta.
+
+El sistema de colas resuelve eso: el usuario hace clic, el servidor responde de inmediato, y un worker independiente va procesando en segundo plano. Si una factura falla, se reintenta automáticamente. 
+
+¿Cómo manejas los fallos?
+
+Cada factura tiene un estado en la tabla. Si el worker falla al enviar una factura al SAT, no marca como fallida de inmediato, sino que incrementa un contador de intentos. Si llega a 3 intentos fallidos, entonces sí la marca como failed y registra el error. Así el administrador puede ver exactamente qué facturas fallaron y por qué, sin perder las demás.
+
+
+ ¿Cómo notificas al usuario del progreso?
+
+El frontend hace una consulta cada pocos segundos a un endpoint que devuelve cuántas facturas van procesadas, cuántas fallaron y cuántas faltan. Con eso muestro una barra de progreso simple. No necesito WebSockets ni nada avanzado, con polling básico es suficiente para este caso. y al final puede ir viendo las facturas que fallan  o las que ya estan terminadas.
+
+La idea central en una línea: el usuario no espera, Redis guarda la fila, y un proceso aparte va despachando.
+Los 5 pasos son:
+
+El usuario hace clic y el servidor responde al instante, sin procesar nada todavía.
+PHP mete los 500 jobs en Redis, como una lista de pendientes.
+Redis guarda esa lista. No procesa nada, solo la tiene lista para entregar.
+Un worker PHP (proceso separado) va tomando jobs de Redis uno por uno y los procesa.
+El worker llama al SAT por cada factura y guarda el resultado.
+
+Mientras todo eso pasa en segundo plano, el usuario ve la barra avanzar. Si algo falla, el worker lo reintenta solo, sin interrumpir las demás.
+
+
