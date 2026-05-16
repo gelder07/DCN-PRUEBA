@@ -270,3 +270,14 @@ El worker llama al SAT por cada factura y guarda el resultado.
 Mientras todo eso pasa en segundo plano, el usuario ve la barra avanzar. Si algo falla, el worker lo reintenta solo, sin interrumpir las demás.
 
 
+## Debugging de Problema Bizarro
+
+PHP tiene una regla:
+
+Primero los headers, después el contenido. Sin excepciones.
+
+Yo creo que el codigo falla porque en la funcion requireAuth está imprimiendo algo sin que te des cuenta echo, print, un warning, un espacio, etcc. justo antes del header
+
+En desarrollo PHP guarda todo en memoria antes de enviarlo, entonces los errores se esconden.
+
+En producción no hay esa caracteriztica , todo sale al momento. Si algo se imprimió antes del header, PHP que rompe.
